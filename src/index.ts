@@ -2,7 +2,7 @@
  * @dsh-external/ui-file-browser — host half.
  * Serves workspace directory listings and safe file reads for the browser UI.
  */
-import { readFile, readdir, rename, rm, stat } from 'node:fs/promises'
+import { readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from 'cordis'
@@ -16,6 +16,7 @@ const API_PREFIX = '/@dsh-external/ui-file-browser/api'
 const WORKSPACES_PATH = '/@dsh-external/ui-file-browser/api/workspaces'
 const TREE_PATH = '/@dsh-external/ui-file-browser/api/tree'
 const FILE_PATH = '/@dsh-external/ui-file-browser/api/file'
+const WRITE_PATH = '/@dsh-external/ui-file-browser/api/write'
 const RENAME_PATH = '/@dsh-external/ui-file-browser/api/rename'
 const DELETE_PATH = '/@dsh-external/ui-file-browser/api/delete'
 const MOVE_PATH = '/@dsh-external/ui-file-browser/api/move'
@@ -23,9 +24,26 @@ const STATE_PATH = '/@dsh-external/ui-file-browser/api/state'
 const MAX_FILE_BYTES = 1024 * 1024
 const SKIP_DIRS = new Set(['.git', 'node_modules', 'dist', 'lib', 'coverage', '.next', '.turbo'])
 
+const IMAGE_MIME: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  bmp: 'image/bmp',
+  svg: 'image/svg+xml',
+}
+
+function isImageFile(path: string): boolean {
+  const base = path.split(/[\\/]/).pop() ?? ''
+  const ext = base.includes('.') ? base.slice(base.lastIndexOf('.') + 1).toLowerCase() : ''
+  return IMAGE_MIME[ext] !== undefined
+}
+
 const fileBrowserStateSchema = zod.object({
   opened: zod.array(zod.string()),
   active: zod.string().nullable(),
+  markdownMode: zod.enum(['editor', 'split', 'preview']).optional(),
 })
 
 const FILE_BROWSER_DOMAIN_SPEC = defineDomain({
@@ -130,7 +148,11 @@ export async function apply(ctx: Context): Promise<void> {
           return
         }
         const state = fileBrowserDomain?.table('state').get(root)
-        sendJson(res, 200, { opened: state?.opened ?? [], active: state?.active ?? null })
+        sendJson(res, 200, {
+          opened: state?.opened ?? [],
+          active: state?.active ?? null,
+          markdownMode: state?.markdownMode ?? 'editor',
+        })
         return
       }
 
@@ -149,9 +171,11 @@ export async function apply(ctx: Context): Promise<void> {
           sendJson(res, 400, { error: 'root and opened are required' })
           return
         }
+        const markdownMode = body.markdownMode === 'split' || body.markdownMode === 'preview' ? body.markdownMode : body.markdownMode === 'editor' ? 'editor' : undefined
         const next = {
           opened,
           active: typeof active === 'string' ? active : null,
+          ...(markdownMode === undefined ? {} : { markdownMode }),
         }
         await fileBrowserDomain?.table('state').put(root, next)
         sendJson(res, 200, { ok: true })
@@ -208,8 +232,41 @@ export async function apply(ctx: Context): Promise<void> {
             sendJson(res, 413, { error: 'file is too large to preview' })
             return
           }
+          if (isImageFile(resolved)) {
+            const ext = resolved.split('.').pop()?.toLowerCase() ?? ''
+            const mime = IMAGE_MIME[ext] ?? 'application/octet-stream'
+            const buffer = await readFile(resolved)
+            sendJson(res, 200, { path: resolved, kind: 'image', dataUrl: `data:${mime};base64,${buffer.toString('base64')}` })
+            return
+          }
           const content = await readFile(resolved, 'utf8')
-          sendJson(res, 200, { path: resolved, content })
+          sendJson(res, 200, { path: resolved, kind: 'text', content })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          sendJson(res, 500, { error: message })
+        }
+        return
+      }
+
+      if (req.method === 'POST' && pathname === WRITE_PATH) {
+        let body: any
+        try {
+          body = JSON.parse(await readBody(req))
+        } catch {
+          sendJson(res, 400, { error: 'invalid JSON body' })
+          return
+        }
+        const root = body.root
+        const path = body.path
+        const content = body.content
+        if (typeof root !== 'string' || root === '' || typeof path !== 'string' || path === '' || typeof content !== 'string') {
+          sendJson(res, 400, { error: 'root, path and content are required' })
+          return
+        }
+        try {
+          const resolved = ensureInside(root, path)
+          await writeFile(resolved, content, 'utf8')
+          sendJson(res, 200, { ok: true, path: resolved })
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
           sendJson(res, 500, { error: message })

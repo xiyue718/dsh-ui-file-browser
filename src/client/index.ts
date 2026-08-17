@@ -6,6 +6,7 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { createRoot, type Root } from 'react-dom/client'
+import { MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
 
 export const inject = ['slots']
 
@@ -73,6 +74,18 @@ function detectCategory(path: string): FileCategory {
   return 'other'
 }
 
+function isImageFile(path: string): boolean {
+  const base = path.split(/[\\/]/).pop() ?? ''
+  const ext = base.includes('.') ? base.slice(base.lastIndexOf('.') + 1).toLowerCase() : ''
+  return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'].includes(ext)
+}
+
+function isMarkdownFile(path: string): boolean {
+  const base = path.split(/[\\/]/).pop() ?? ''
+  const ext = base.includes('.') ? base.slice(base.lastIndexOf('.') + 1).toLowerCase() : ''
+  return ext === 'md' || ext === 'markdown'
+}
+
 const KEYWORDS = new Set([
   'const', 'let', 'var', 'function', 'return', 'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break',
   'continue', 'new', 'class', 'extends', 'super', 'this', 'typeof', 'instanceof', 'in', 'of', 'try', 'catch',
@@ -124,7 +137,7 @@ function fmtSize(size: number): string {
   return `${(size / 1024 / 1024).toFixed(1)} MB`
 }
 
-async function loadFileState(root: string): Promise<{ opened: string[]; active: string | null }> {
+async function loadFileState(root: string): Promise<{ opened: string[]; active: string | null; markdownMode: 'editor' | 'split' | 'preview' }> {
   try {
     const response = await fetch(`${API_PREFIX}/state?root=${encodeURIComponent(root)}`)
     const data = await response.json()
@@ -132,19 +145,20 @@ async function loadFileState(root: string): Promise<{ opened: string[]; active: 
     return {
       opened: Array.isArray(data.opened) ? data.opened.filter((item: unknown): item is string => typeof item === 'string') : [],
       active: typeof data.active === 'string' ? data.active : null,
+      markdownMode: data.markdownMode === 'split' || data.markdownMode === 'preview' ? data.markdownMode : 'editor',
     }
   } catch {
     // Ignore storage failures and start empty.
-    return { opened: [], active: null }
+    return { opened: [], active: null, markdownMode: 'editor' }
   }
 }
 
-async function saveFileState(root: string, opened: readonly string[], active: string | null): Promise<void> {
+async function saveFileState(root: string, opened: readonly string[], active: string | null, markdownMode: 'editor' | 'split' | 'preview'): Promise<void> {
   try {
     await fetch(`${API_PREFIX}/state`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ root, opened: [...opened], active }),
+      body: JSON.stringify({ root, opened: [...opened], active, markdownMode }),
     })
   } catch {
     // Ignore storage failures; persistence is best-effort.
@@ -391,6 +405,48 @@ function MoveIcon() {
     strokeLinejoin: 'round',
     'aria-hidden': true,
   }, React.createElement('path', { d: 'M3 7v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-7l-2-2H5a2 2 0 0 0-2 2z' }), React.createElement('path', { d: 'M12 12v6' }), React.createElement('path', { d: 'M9 15l3 3 3-3' }))
+}
+
+function EditorIcon() {
+  return React.createElement('svg', {
+    width: 14,
+    height: 14,
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+    'aria-hidden': true,
+  }, React.createElement('path', { d: 'M8 6l-5 6 5 6' }), React.createElement('path', { d: 'M16 6l5 6-5 6' }))
+}
+
+function SplitIcon() {
+  return React.createElement('svg', {
+    width: 14,
+    height: 14,
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+    'aria-hidden': true,
+  }, React.createElement('rect', { x: 3, y: 4, width: 18, height: 16, rx: 2 }), React.createElement('path', { d: 'M12 4v16' }))
+}
+
+function PreviewIcon() {
+  return React.createElement('svg', {
+    width: 14,
+    height: 14,
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+    'aria-hidden': true,
+  }, React.createElement('path', { d: 'M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z' }), React.createElement('circle', { cx: 12, cy: 12, r: 3 }))
 }
 
 function buildTree(entries: FileEntry[]): TreeNode[] {
@@ -856,21 +912,86 @@ function FilesView(props: any) {
   const [active, setActive] = useState<string | null>(null)
   const [hydrated, setHydrated] = useState(false)
   const [content, setContent] = useState('')
+  const [imageDataUrl, setImageDataUrl] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [saveStatus, setSaveStatus] = useState('')
   const [filesExpanded, setFilesExpanded] = useState(false)
   const [filesOverflow, setFilesOverflow] = useState(false)
+  const [markdownMode, setMarkdownMode] = useState<'editor' | 'split' | 'preview'>('editor')
+  const [barRect, setBarRect] = useState<{ left: number; width: number } | null>(null)
+  const [headerRect, setHeaderRect] = useState<{ top: number; left: number; width: number; height: number } | null>(null)
   const measureRef = useRef<HTMLDivElement | null>(null)
   const tabsRef = useRef<HTMLDivElement | null>(null)
+  const headerRef = useRef<HTMLDivElement | null>(null)
+  const rootRef = useRef<HTMLDivElement | null>(null)
+  const codeScrollRef = useRef<HTMLDivElement | null>(null)
+  const topScrollRef = useRef<HTMLDivElement | null>(null)
+  const contentScrollRef = useRef<HTMLDivElement | null>(null)
+  const highlightRef = useRef<HTMLPreElement | null>(null)
+  const lineNumbersRef = useRef<HTMLDivElement | null>(null)
+  const scrollPositions = useRef<Map<string, { left: number; top: number }>>(new Map())
+  const activeRef = useRef(active)
+  activeRef.current = active
+
+  function saveScrollPosition() {
+    const key = activeRef.current
+    if (key !== null) {
+      scrollPositions.current.set(key, {
+        left: codeScrollRef.current?.scrollLeft ?? 0,
+        top: codeScrollRef.current?.scrollTop ?? 0,
+      })
+    }
+  }
+
+  function syncHighlightScroll() {
+    if (codeScrollRef.current !== null && highlightRef.current !== null) {
+      highlightRef.current.scrollTop = codeScrollRef.current.scrollTop
+      highlightRef.current.scrollLeft = codeScrollRef.current.scrollLeft
+    }
+    if (codeScrollRef.current !== null && lineNumbersRef.current !== null) {
+      lineNumbersRef.current.scrollTop = codeScrollRef.current.scrollTop
+    }
+  }
 
   useLayoutEffect(() => {
     const el = measureRef.current
     if (el) setFilesOverflow(el.scrollHeight > 36)
   }, [opened])
 
+  useLayoutEffect(() => {
+    const root = rootRef.current
+    const header = headerRef.current
+    if (root === null) return
+    const measure = () => {
+      const rect = root.getBoundingClientRect()
+      setBarRect({ left: rect.left, width: rect.width })
+      if (header !== null) {
+        const headerBounds = header.getBoundingClientRect()
+        setHeaderRect({
+          top: headerBounds.top,
+          left: headerBounds.left,
+          width: headerBounds.width,
+          height: headerBounds.height,
+        })
+      }
+    }
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(root)
+    if (header !== null) observer.observe(header)
+    window.addEventListener('resize', measure)
+    window.addEventListener('scroll', measure, true)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', measure)
+      window.removeEventListener('scroll', measure, true)
+    }
+  }, [active, content])
+
   useEffect(() => {
-    if (hydrated && typeof cwd === 'string' && cwd !== '') void saveFileState(cwd, opened, active)
-  }, [hydrated, cwd, opened, active])
+    if (hydrated && typeof cwd === 'string' && cwd !== '') void saveFileState(cwd, opened, active, markdownMode)
+  }, [hydrated, cwd, opened, active, markdownMode])
 
   useEffect(() => {
     if (typeof cwd !== 'string' || cwd === '') {
@@ -888,13 +1009,76 @@ function FilesView(props: any) {
         : saved.opened
       setOpened(nextOpened)
       setActive(pending?.path ?? saved.active)
+      setMarkdownMode(saved.markdownMode)
       if (pending !== null) void loadContent(pending.path, pending.root)
       else if (saved.active !== null) void loadContent(saved.active)
-      else setContent('')
+      else {
+        setContent('')
+        setImageDataUrl(null)
+      }
       setHydrated(true)
     })
     return () => { current = false }
   }, [cwd])
+
+  useEffect(() => {
+    return () => {
+      const key = active
+      if (key !== null) {
+        scrollPositions.current.set(key, {
+          left: codeScrollRef.current?.scrollLeft ?? 0,
+          top: contentScrollRef.current?.scrollTop ?? 0,
+        })
+      }
+    }
+  }, [active])
+
+  useLayoutEffect(() => {
+    const saved = active === null ? undefined : scrollPositions.current.get(active)
+    if (codeScrollRef.current !== null) {
+      codeScrollRef.current.scrollLeft = saved?.left ?? 0
+      codeScrollRef.current.scrollTop = saved?.top ?? 0
+      syncHighlightScroll()
+    }
+    if (topScrollRef.current !== null) topScrollRef.current.scrollLeft = saved?.left ?? 0
+  }, [active, content])
+
+  useEffect(() => {
+    const content = codeScrollRef.current
+    const top = topScrollRef.current
+    if (content === null || top === null) return
+    const savePosition = () => {
+      if (active !== null) {
+        scrollPositions.current.set(active, {
+          left: content.scrollLeft,
+          top: content.scrollTop,
+        })
+      }
+    }
+    const syncTop = () => {
+      savePosition()
+      syncHighlightScroll()
+      top.scrollLeft = content.scrollLeft
+    }
+    const syncContent = () => { content.scrollLeft = top.scrollLeft }
+    const updateSpacer = () => {
+      const spacer = top.firstElementChild as HTMLElement | null
+      if (spacer !== null) spacer.style.width = `${Math.max(content.scrollWidth, top.clientWidth)}px`
+    }
+    content.addEventListener('scroll', syncTop)
+    top.addEventListener('scroll', syncContent)
+    const observer = new ResizeObserver(() => {
+      updateSpacer()
+      syncTop()
+    })
+    observer.observe(content)
+    updateSpacer()
+    return () => {
+      content.removeEventListener('scroll', syncTop)
+      top.removeEventListener('scroll', syncContent)
+      observer.disconnect()
+    }
+  }, [active, markdownMode, content])
 
   useEffect(() => {
     function onOpenFile(event: Event) {
@@ -919,18 +1103,61 @@ function FilesView(props: any) {
       : workspaceRoot
     setLoading(true)
     setError('')
+    setSaveStatus('')
+    setImageDataUrl(null)
     try {
       const response = await fetch(`${API_PREFIX}/file?root=${encodeURIComponent(effectiveRoot)}&path=${encodeURIComponent(resolvedPath)}`)
       const data = await response.json()
       if (!response.ok) throw new Error(data.error ?? '读取文件失败')
-      setContent(data.content ?? '')
+      if (data.kind === 'image' && typeof data.dataUrl === 'string') {
+        setContent('')
+        setImageDataUrl(data.dataUrl)
+      } else {
+        setContent(data.content ?? '')
+        setImageDataUrl(null)
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
       setContent('')
+      setImageDataUrl(null)
     } finally {
       setLoading(false)
     }
   }
+
+  async function saveContent() {
+    if (active === null || imageDataUrl !== null) return
+    const workspaceRoot = cwdRef.current
+    if (!workspaceRoot) return
+    const resolvedPath = resolveWorkspacePath(workspaceRoot, active)
+    const effectiveRoot = isAbsolutePath(active) && !isPathInside(workspaceRoot, resolvedPath)
+      ? dirnamePath(resolvedPath)
+      : workspaceRoot
+    setSaveStatus('保存中…')
+    try {
+      const response = await fetch(`${API_PREFIX}/write`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ root: effectiveRoot, path: resolvedPath, content }),
+      })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error ?? '保存失败')
+      setSaveStatus('已保存')
+    } catch (err) {
+      setSaveStatus(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+        event.preventDefault()
+        void saveContent()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [active, imageDataUrl, content, cwd])
 
   function closeFile(path: string) {
     const next = opened.filter(candidate => candidate !== path)
@@ -938,7 +1165,10 @@ function FilesView(props: any) {
     if (active === path) {
       setActive(next.length > 0 ? next[next.length - 1] : null)
       if (next.length > 0) void loadContent(next[next.length - 1])
-      else setContent('')
+      else {
+        setContent('')
+        setImageDataUrl(null)
+      }
     }
   }
 
@@ -954,6 +1184,7 @@ function FilesView(props: any) {
     'span',
     {
       key: path,
+      'data-dsh-file-tab': 'true',
       style: {
         display: 'inline-flex',
         alignItems: 'center',
@@ -1006,25 +1237,198 @@ function FilesView(props: any) {
     }, filesExpanded ? React.createElement(ChevronUpIcon) : React.createElement(ChevronDownIcon))
     : null
 
-  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, padding: 12, height: '100%', boxSizing: 'border-box' } },
-    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, borderBottom: '1px solid var(--dsw-alias-border-primary, #e5e5e5)', paddingBottom: 8 } },
+  const isMarkdownActive = active !== null && isMarkdownFile(active)
+  const modeSwitcher = isMarkdownActive
+    ? React.createElement('div', { style: { display: 'inline-flex', gap: 2, marginLeft: 'auto', flexShrink: 0 } },
+      [['editor', EditorIcon, '编辑器模式'], ['split', SplitIcon, '编辑器与预览模式'], ['preview', PreviewIcon, '预览模式']].map(([mode, Icon, label]) => {
+        const selected = markdownMode === mode
+        return React.createElement('button', {
+          key: mode as string,
+          type: 'button',
+          title: label as string,
+          'aria-label': label as string,
+          onClick: () => setMarkdownMode(mode as 'editor' | 'split' | 'preview'),
+          style: {
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: 24,
+            height: 24,
+            padding: 0,
+            border: 'none',
+            background: selected ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
+            cursor: 'pointer',
+            color: selected ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary, #666)',
+            borderRadius: 6,
+          },
+        }, React.createElement(Icon as () => React.ReactElement))
+      }),
+    )
+    : null
+
+  const saveButton = active !== null && imageDataUrl === null
+    ? React.createElement('div', { style: { display: 'inline-flex', alignItems: 'center', gap: 6, marginLeft: modeSwitcher === null ? 'auto' : 0, flexShrink: 0 } },
+      saveStatus === '' ? null : React.createElement('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary, #666)' } }, saveStatus),
+      React.createElement('button', {
+        type: 'button',
+        onClick: () => void saveContent(),
+        disabled: loading,
+        style: buttonStyle,
+      }, '保存'),
+    )
+    : null
+
+  const codeEditorNode = React.createElement('div', { style: { display: 'flex', flex: 1, minWidth: 0, minHeight: 0 } },
+    React.createElement('div', {
+      ref: lineNumbersRef,
+      style: {
+        flexShrink: 0,
+        width: 52,
+        overflow: 'hidden',
+        padding: '8px 0',
+        textAlign: 'right',
+        color: 'var(--dsw-alias-label-tertiary, #999)',
+        userSelect: 'none',
+        borderRight: '1px solid var(--dsw-alias-border-primary, #eee)',
+        fontFamily: 'monospace',
+        fontSize: 14,
+        lineHeight: 1.6,
+      },
+    },
+      React.createElement('div', { style: { paddingRight: 6 } },
+        content.split('\n').map((_, index) => React.createElement('div', { key: index }, index + 1)),
+      ),
+    ),
+    React.createElement('div', { style: { position: 'relative', flex: 1, minWidth: 0, minHeight: 0, overflow: 'hidden' } },
+      React.createElement('pre', {
+        ref: highlightRef,
+        'aria-hidden': true,
+        style: {
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          margin: 0,
+          padding: '8px 10px',
+          fontFamily: 'monospace',
+          fontSize: 14,
+          lineHeight: 1.6,
+          whiteSpace: 'pre',
+          overflow: 'hidden',
+          pointerEvents: 'none',
+          color: 'var(--dsw-alias-label-primary)',
+        },
+      },
+        content.split('\n').map((line, index) => React.createElement('div', { key: index }, highlightLine(line))),
+      ),
+      React.createElement('textarea', {
+        ref: codeScrollRef,
+        className: 'dsh-file-code-scroll',
+        value: content,
+        onChange: (event: React.ChangeEvent<HTMLTextAreaElement>) => setContent(event.target.value),
+        onScroll: () => {
+          saveScrollPosition()
+          syncHighlightScroll()
+        },
+        spellCheck: false,
+        style: {
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          width: '100%',
+          height: '100%',
+          boxSizing: 'border-box',
+          padding: '8px 10px',
+          fontFamily: 'monospace',
+          fontSize: 14,
+          lineHeight: 1.6,
+          whiteSpace: 'pre',
+          overflow: 'auto',
+          border: 'none',
+          outline: 'none',
+          resize: 'none',
+          background: 'transparent',
+          color: 'transparent',
+          WebkitTextFillColor: 'transparent',
+          caretColor: 'var(--dsw-alias-label-primary)',
+        },
+      }),
+    ),
+  )
+
+  const markdownPreviewNode = React.createElement('div', { style: { padding: '8px 12px', fontFamily: 'inherit', fontSize: 14, lineHeight: 1.7, overflow: 'auto', flex: 1, minWidth: 0, minHeight: 0 } },
+    React.createElement(MarkdownText, { text: content }),
+  )
+
+  return React.createElement('div', { ref: rootRef, style: { display: 'flex', flexDirection: 'column', gap: 10, padding: 12, height: '100%', boxSizing: 'border-box' } },
+    React.createElement('div', {
+      ref: headerRef,
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        borderBottom: '1px solid var(--dsw-alias-border-primary, #e5e5e5)',
+        paddingBottom: 8,
+        position: 'sticky',
+        top: 0,
+        zIndex: 5,
+        background: 'var(--dsw-alias-bg-layer-1, #fafafa)',
+      },
+    },
       openedTabs.length === 0
         ? React.createElement('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary, #666)' } }, '尚未打开文件')
         : React.createElement(React.Fragment, null, tabsContainer, filesToggle),
+      modeSwitcher,
+      saveButton,
     ),
-    React.createElement('div', { style: { flex: 1, overflow: 'auto', fontFamily: 'monospace', fontSize: 12, background: 'var(--dsw-alias-bg-layer-1, #fafafa)', borderRadius: 8 } },
+    React.createElement('div', { ref: contentScrollRef, style: { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', fontFamily: 'monospace', fontSize: 12, background: 'var(--dsw-alias-bg-layer-1, #fafafa)', borderRadius: 8 } },
       error !== '' ? React.createElement('span', { style: { color: 'var(--dsw-alias-state-error-primary, #d33)', padding: 8 } }, error)
         : active === null ? React.createElement('span', { style: { padding: 8, color: 'var(--dsw-alias-label-secondary, #666)' } }, '点击聊天中的文件链接或从文件导航栏打开文件后，内容将显示在这里')
           : loading ? React.createElement('span', { style: { padding: 8 } }, '加载中…')
-            : React.createElement('div', { style: { display: 'flex', minHeight: '100%' } },
-              React.createElement('div', { style: { flexShrink: 0, padding: '8px 6px', textAlign: 'right', color: 'var(--dsw-alias-label-tertiary, #999)', userSelect: 'none', borderRight: '1px solid var(--dsw-alias-border-primary, #eee)', fontFamily: 'monospace', fontSize: 12, lineHeight: 1.6 } },
-                content.split('\n').map((_, index) => React.createElement('div', { key: index }, index + 1)),
-              ),
-              React.createElement('div', { style: { flex: 1, padding: '8px 10px', fontFamily: 'monospace', fontSize: 12, lineHeight: 1.6, whiteSpace: 'pre', overflowX: 'auto' } },
-                content.split('\n').map((line, index) => React.createElement('div', { key: index }, highlightLine(line))),
-              ),
-            ),
+            : imageDataUrl !== null
+              ? React.createElement('div', { style: { display: 'flex', flex: 1, minHeight: 0, alignItems: 'center', justifyContent: 'center', padding: 12 } },
+                React.createElement('img', {
+                  src: imageDataUrl,
+                  alt: active ?? '图片预览',
+                  style: { maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', borderRadius: 8 },
+                }),
+              )
+              : active !== null && isMarkdownFile(active)
+                ? markdownMode === 'preview'
+                  ? markdownPreviewNode
+                  : markdownMode === 'split'
+                    ? React.createElement('div', { style: { display: 'flex', flex: 1, minHeight: 0, width: '100%' } },
+                      codeEditorNode,
+                      React.createElement('div', { style: { width: 2, background: 'var(--dsw-alias-border-primary, #ccc)', flexShrink: 0, margin: '8px 0' } }),
+                      markdownPreviewNode,
+                    )
+                    : codeEditorNode
+                : codeEditorNode,
     ),
+    active !== null && imageDataUrl === null
+      ? createPortal(
+        React.createElement('div', {
+          ref: topScrollRef,
+          className: 'dsh-file-bottom-scroll',
+          style: {
+            position: 'fixed',
+            top: (headerRect === null ? 0 : headerRect.top + headerRect.height),
+            left: barRect?.left ?? 0,
+            width: barRect?.width ?? '100%',
+            overflowX: 'auto',
+            overflowY: 'hidden',
+            height: 10,
+            zIndex: 1000,
+            background: 'var(--dsw-alias-bg-layer-1, #fafafa)',
+            borderTop: '1px solid var(--dsw-alias-border-primary, #e5e5e5)',
+          },
+        },
+        React.createElement('div', { style: { height: 1 } }),
+        ),
+        document.body,
+      )
+      : null,
   )
 }
 
@@ -1185,7 +1589,7 @@ function installFileLinkInterceptor(): () => void {
 export function apply(ctx: any): void {
   ctx.effect(() => {
     const style = document.createElement('style')
-    style.textContent = '@keyframes dsh-file-browser-slide-in { from { transform: translateX(100%); } to { transform: translateX(0); } } [data-dsh-file-row]:hover { background: var(--dsw-alias-interactive-bg-hover); }'
+    style.textContent = '@keyframes dsh-file-browser-slide-in { from { transform: translateX(100%); } to { transform: translateX(0); } } [data-dsh-file-row] { border-radius: 8; transition: background .15s ease; } [data-dsh-file-row]:hover { background: var(--dsw-alias-interactive-bg-hover) !important; } [data-dsh-file-tab] { transition: background .15s ease; } [data-dsh-file-tab]:hover { background: var(--dsw-alias-interactive-bg-hover) !important; } .dsh-file-code-scroll::-webkit-scrollbar:horizontal { height: 0; } .dsh-file-bottom-scroll::-webkit-scrollbar { height: 8px; } .dsh-file-bottom-scroll::-webkit-scrollbar-thumb { background: var(--dsw-alias-border-primary, #ccc); border-radius: 4px; } .dsh-file-bottom-scroll::-webkit-scrollbar-track { background: transparent; }'
     document.head.appendChild(style)
     return () => { style.remove() }
   }, '@dsh-external/ui-file-browser: keyframes')
